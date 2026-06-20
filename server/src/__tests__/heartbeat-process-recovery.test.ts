@@ -2581,7 +2581,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   // its only valid continuation is the blocker resolving. PR #8245 suppressed
   // the max-turn continuation path only; this covers the continuationAttempt=0
   // reconcile path that re-posted an identical blocked status on LIB-554.
-  it("suppresses timer recovery for a blocked routine_execution issue", async () => {
+  // LIB-579 (security-reviewer Finding 1 on PR #8374): a blocked routine with
+  // *no unresolved blocker* must not be silently skipped forever. LIB-577 stops
+  // the timer replay; LIB-579 additionally escalates it to `blocked` so it is
+  // visible for intervention (nothing else will ever wake it).
+  it("escalates a blocked routine_execution issue with no resolvable blocker", async () => {
     const { agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "succeeded",
@@ -2591,8 +2595,69 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
+    // No wasteful `productive_terminal_continuation_recovery` replay of the
+    // identical blocked status (the LIB-577 win is preserved)...
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.blockedRoutineContinuationSuppressed).toBe(0);
+    // ...but it is no longer silently skipped: it escalates to `blocked`.
+    expect(result.blockedRoutineEscalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    // Escalation routes to a recovery owner instead of replaying the original
+    // assignee's blocked context; settle any spawned recovery run so the test
+    // does not leak an in-flight run.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const recoveryRun = runs.find((row) => row.id !== runId);
+    if (recoveryRun) {
+      await waitForRunToSettle(heartbeat, recoveryRun.id);
+    }
+  });
+
+  // LIB-577 behaviour preserved: while a blocked routine still has an unresolved
+  // blocker, that blocker resolving is its valid continuation (auto-wakes via
+  // `issue_blockers_resolved`), so timer recovery stays suppressed and it is NOT
+  // escalated yet.
+  it("still suppresses timer recovery for a blocked routine_execution issue with an unresolved blocker", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "blocked",
+      originKind: "routine_execution",
+    });
+
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Unresolved blocker",
+      status: "in_progress",
+      priority: "medium",
+      issueNumber: 999,
+      identifier: "BLK-999",
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
     expect(result.continuationRequeued).toBe(0);
     expect(result.blockedRoutineContinuationSuppressed).toBe(1);
+    expect(result.blockedRoutineEscalated).toBe(0);
     expect(result.escalated).toBe(0);
     expect(result.issueIds).toEqual([]);
 

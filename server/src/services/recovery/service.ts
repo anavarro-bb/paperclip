@@ -2662,6 +2662,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
       blockedRoutineContinuationSuppressed: 0,
+      blockedRoutineEscalated: 0,
       orphanBlockersAssigned: 0,
       successfulRunHandoffEscalated: 0,
       escalated: 0,
@@ -2826,8 +2827,52 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           issue.originKind === "routine_execution" &&
           successfulRun.livenessState === "blocked"
         ) {
-          result.blockedRoutineContinuationSuppressed += 1;
-          result.skipped += 1;
+          // LIB-579 (security-reviewer Finding 1 on PR #8374): LIB-577 stops the
+          // wasteful timer replay, but on its own it would silently skip a
+          // blocked routine on every reconcile tick forever. A routine stuck
+          // `in_progress` + blocked with *no unresolved blocker that could ever
+          // resolve* then never replays (good) yet never becomes visible for
+          // intervention either — the residual edge the security review flagged.
+          //
+          // If the routine still has at least one unresolved blocker, that
+          // blocker resolving is its valid continuation (it auto-wakes via
+          // `issue_blockers_resolved`), so keep suppressing per LIB-577.
+          // Otherwise there is nothing left to wake it, so escalate to `blocked`
+          // for visibility, mirroring the non-routine
+          // `isRepeatedProductiveContinuationRecovery` escalate-to-`blocked`
+          // path below.
+          //
+          // Optional follow-up (LIB-634): once this branch rebases onto a base
+          // that exposes a per-routine recovery budget / maxTurns field on
+          // `routine_execution` issues, also escalate a still-blockered routine
+          // once it has consumed that budget. The no-resolvable-blocker case
+          // here fully closes the reported security finding on its own.
+          const unresolvedBlockerIds = await existingUnresolvedBlockerIssueIds(
+            issue.companyId,
+            issue.id,
+          );
+          if (unresolvedBlockerIds.length > 0) {
+            result.blockedRoutineContinuationSuppressed += 1;
+            result.skipped += 1;
+            continue;
+          }
+
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun: successfulRun,
+            comment:
+              "This `routine_execution` issue is stuck `in_progress` with a blocked latest run and has no " +
+              "unresolved blocker that could ever resolve to wake it. Paperclip suppressed timer recovery " +
+              "(LIB-577) to avoid replaying an identical blocked status, but that left it silently skipped on " +
+              "every reconcile tick. Moving it to `blocked` so it is visible for intervention.",
+          });
+          if (updated) {
+            result.blockedRoutineEscalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
           continue;
         }
 
